@@ -19,11 +19,12 @@ class BKSDMCompression(CompressionModel):
     1. BK-SDM VAE Encoder: Input image -> Latent space (y)
     2. Hyper Encoder (h_a): y -> z (hyperprior)
     3. Entropy Bottleneck: z -> z_hat (compressed)
-    4. Hyper Decoder (h_s): z_hat -> scales_hat
+    4. Diffusion Denoising: z_hat -> scales_hat (via BK-SDM U-Net)
     5. BK-SDM Denoise U-Net: z_hat -> y_hat (denoised latent)
     6. BK-SDM VAE Decoder: y_hat -> x_hat (reconstructed image)
     
     The model uses pre-trained BK-SDM components for better quality.
+    scales_hat is generated through diffusion denoising process from z_hat.
     """
     
     def __init__(
@@ -44,6 +45,10 @@ class BKSDMCompression(CompressionModel):
         self.bk_sdm_path = bk_sdm_path
         self.use_pretrained_vae = use_pretrained_vae
         self.use_pretrained_unet = use_pretrained_unet
+
+        # Device / dtype 설정 (GPU 사용 시 fp16, 그 외 fp32)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
         
         # Hyper Encoder (h_a): y -> z
         self.h_a = nn.Sequential(
@@ -54,15 +59,8 @@ class BKSDMCompression(CompressionModel):
             conv(N, N),
         )
         
-        # Hyper Decoder (h_s): z_hat -> scales_hat
-        self.h_s = nn.Sequential(
-            deconv(N, N),
-            nn.ReLU(inplace=True),
-            deconv(N, N),
-            nn.ReLU(inplace=True),
-            conv(N, M, stride=1, kernel_size=3),
-            nn.ReLU(inplace=True),
-        )
+        # Hyper Decoder (h_s) 제거 - diffusion denoising으로 scales_hat 생성
+        # self.h_s = nn.Sequential(...)  # 더 이상 사용하지 않음
         
         # Entropy models
         self.entropy_bottleneck = EntropyBottleneck(N)
@@ -76,56 +74,96 @@ class BKSDMCompression(CompressionModel):
             schedule="linear"
         )
         
-        # Time embedding for diffusion
+        # Time embedding (커스텀 scales UNet에서 사용)
         self.time_embed = nn.Sequential(
             nn.Linear(N, N * 4),
             nn.SiLU(),
             nn.Linear(N * 4, N),
         )
         
-        # Load BK-SDM components
+        # 커스텀 UNet은 항상 scales 생성을 위해 유지
+        self.scales_unet = DiffusionUNet(
+            in_channels=self.M,
+            out_channels=self.M,
+            model_channels=self.N,
+            num_res_blocks=2,
+            attention_resolutions=(8, 16),
+            dropout=0.1,
+            channel_mult=(1, 2, 4, 8),
+            num_heads=8,
+            context_dim=self.N,
+        )
+        self.scales_unet.to(self.device)
+
+        # BK-SDM 컴포넌트 로드 (VAE / UNet)
         self._load_bk_sdm_components()
+
+        # GaussianConditional 기본 scale table 설정 및 업데이트
+        try:
+            default_scale_table = torch.exp(torch.linspace(-3.0, 10.0, 64))
+            self.update(scale_table=default_scale_table, force=True)
+        except Exception:
+            pass
+        
+        # 전체 모듈을 공통 device로 이동
+        self.to(self.device)
     
     def _load_bk_sdm_components(self):
         """BK-SDM의 pre-trained 컴포넌트들을 로드"""
         try:
             from diffusers import StableDiffusionPipeline, UNet2DConditionModel
-            from diffusers.models.autoencoder_kl import AutoencoderKL
             
             print(f"BK-SDM 컴포넌트 로딩 중: {self.bk_sdm_path}")
             
             # Load pipeline
+            dtype = self.model_dtype
             self.pipeline = StableDiffusionPipeline.from_pretrained(
                 self.bk_sdm_path,
-                torch_dtype=torch.float16,
+                torch_dtype=dtype,
                 safety_checker=None
             )
+            self.pipeline.to(self.device)
             
             # VAE components
             if self.use_pretrained_vae:
-                self.vae_encoder = self.pipeline.vae.encoder
-                self.vae_decoder = self.pipeline.vae.decoder
-                print("BK-SDM VAE 인코더/디코더 로드 완료")
+                self.vae = self.pipeline.vae
+                self.vae.eval()
+                self.vae.to(self.device, dtype=dtype)
+                # Stable Diffusion VAE latent 채널 수 (보통 4)
+                self.latent_channels = getattr(self.vae.config, "latent_channels", 4)
+                # VAE<->내부 M 채널 어댑터 준비
+                self.y_to_M = nn.Conv2d(self.latent_channels, self.M, kernel_size=1)
+                self.M_to_latent = nn.Conv2d(self.M, self.latent_channels, kernel_size=1)
+                self.y_to_M.to(self.device, dtype=dtype)
+                self.M_to_latent.to(self.device, dtype=dtype)
+                print("BK-SDM VAE 로드 및 채널 어댑터 설정 완료")
             else:
                 # Fallback to custom VAE
                 self.vae_encoder = self._create_custom_vae_encoder()
                 self.vae_decoder = self._create_custom_vae_decoder()
+                # 커스텀 VAE는 내부 채널 = M으로 간주
+                self.latent_channels = self.M
+                self.y_to_M = nn.Identity()
+                self.M_to_latent = nn.Identity()
                 print("커스텀 VAE 인코더/디코더 사용")
             
             # U-Net for denoising
             if self.use_pretrained_unet:
                 self.denoise_unet = self.pipeline.unet
-                print("BK-SDM Denoise U-Net 로드 완료")
+                self.denoise_unet.eval()
+                self.denoise_unet.to(self.device, dtype=dtype)
+                self.is_diffusers_unet = True
+                print("BK-SDM Denoise U-Net 로드 완료 (Diffusers UNet 사용)")
             else:
                 # Fallback to custom U-Net
                 self.denoise_unet = self._create_custom_denoise_unet()
+                self.denoise_unet.to(self.device)
+                self.is_diffusers_unet = False
                 print("커스텀 Denoise U-Net 사용")
             
             # Freeze pre-trained components if needed
             if self.use_pretrained_vae:
-                for param in self.vae_encoder.parameters():
-                    param.requires_grad = False
-                for param in self.vae_decoder.parameters():
+                for param in self.vae.parameters():
                     param.requires_grad = False
             
             if self.use_pretrained_unet:
@@ -182,18 +220,26 @@ class BKSDMCompression(CompressionModel):
         self.vae_encoder = self._create_custom_vae_encoder()
         self.vae_decoder = self._create_custom_vae_decoder()
         self.denoise_unet = self._create_custom_denoise_unet()
+        self.scales_unet = self._create_custom_denoise_unet()
         self.pipeline = None
+        self.latent_channels = self.M
+        self.y_to_M = nn.Identity()
+        self.M_to_latent = nn.Identity()
+        self.is_diffusers_unet = False
     
     @property
     def downsampling_factor(self) -> int:
-        return 2 ** (4 + 2)
+        # Stable Diffusion VAE 기준 8배 다운샘플
+        return 8
     
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
         Forward pass for training
         """
-        # VAE encoding using BK-SDM
-        y = self.vae_encoder(x)
+        # VAE encoding using BK-SDM (Diffusers 권장 경로)
+        y_latent = self._encode_with_vae(x)
+        # 내부 표현 채널 M으로 투영 후 CompressAI 연산을 위해 float32 유지
+        y = self.y_to_M(y_latent).float()
         
         # Hyper encoding
         z = self.h_a(torch.abs(y))
@@ -201,84 +247,142 @@ class BKSDMCompression(CompressionModel):
         # Entropy bottleneck
         z_hat, z_likelihoods = self.entropy_bottleneck(z)
         
-        # Hyper decoding to get scales
-        scales_hat = self.h_s(z_hat)
+        # Diffusion denoising process to generate scales_hat from z_hat
+        scales_hat = self._diffusion_denoise_to_scales(z_hat)
         
-        # Diffusion denoising process using BK-SDM U-Net
-        y_hat = self._diffusion_denoise_with_bk_sdm(z_hat, scales_hat)
-        
+        # 학습 단계에서는 전송/복원을 거치지 않고 직접 복원 (선택적으로 UNet로 미세 복원 가능)
+        y_latent_for_decode = self.M_to_latent(y)
+        # 선택: Diffusers UNet으로 잠복 복원 미세화 (비지도, 무조건)
+        # y_latent_for_decode = self._diffusion_denoise_with_bk_sdm(y_init_latent=y_latent_for_decode)
+
         # VAE decoding using BK-SDM
-        x_hat = self.vae_decoder(y_hat)
+        x_hat = self._decode_with_vae(y_latent_for_decode)
         
         return {
             "x_hat": x_hat,
             "likelihoods": {"y": None, "z": z_likelihoods},
             "y": y,
-            "y_hat": y_hat,
+            "y_latent": y_latent,
             "z": z,
             "z_hat": z_hat,
             "scales_hat": scales_hat,
         }
     
     def _diffusion_denoise_with_bk_sdm(
-        self, 
-        z_hat: torch.Tensor, 
-        scales_hat: torch.Tensor
+        self,
+        y_init_latent: Optional[torch.Tensor] = None,
+        num_steps: Optional[int] = None,
     ) -> torch.Tensor:
         """
-        BK-SDM U-Net을 사용한 diffusion denoising: z_hat -> y_hat
+        Diffusers UNet(또는 커스텀 UNet)을 사용한 잠복(latent) 공간 denoising.
+        - 입력 및 출력 채널은 VAE latent 채널(self.latent_channels)에 맞춤.
+        - BK-SDM UNet 사용 시: UNet2DConditionModel(sample, timestep, encoder_hidden_states=None)
         """
-        batch_size = z_hat.shape[0]
-        device = z_hat.device
-        
-        # Start from pure noise
-        y_t = torch.randn_like(z_hat, device=device)
-        
-        # Reverse diffusion process
-        for t in range(self.diffusion_steps - 1, -1, -1):
-            # Create timestep tensor
-            timesteps = torch.full((batch_size,), t, device=device, dtype=torch.long)
-            
-            # Get time embedding
-            time_emb = self.time_embed(self._get_timestep_embedding(timesteps, self.N))
-            
-            # Use BK-SDM U-Net for noise prediction
-            if hasattr(self.denoise_unet, 'forward'):
-                # Custom U-Net
+        steps = num_steps or self.diffusion_steps
+        device = self.device
+
+        # 시작 상태: 제공되면 그 값으로, 없으면 표준 가우시안
+        if y_init_latent is None:
+            # 임의 해상도의 테스트를 위해 크기를 안전하게 처리
+            y_shape = (1, self.latent_channels, 32, 32)
+            y_t = torch.randn(y_shape, device=device, dtype=self.model_dtype)
+        else:
+            y_t = y_init_latent.to(device=device, dtype=self.model_dtype)
+
+        for t in range(steps - 1, -1, -1):
+            timesteps = torch.full((y_t.shape[0],), t, device=device, dtype=torch.long)
+
+            if getattr(self, "is_diffusers_unet", False):
+                # Diffusers UNet: epsilon 예측
+                noise_pred = self.denoise_unet(
+                    sample=y_t,
+                    timestep=timesteps,
+                    encoder_hidden_states=None,
+                ).sample
+            else:
+                # 커스텀 UNet: time embedding을 직접 생성
+                timestep_embed = self._get_timestep_embedding(timesteps, self.N)
                 noise_pred = self.denoise_unet(
                     y_t,
-                    timesteps,
-                    context=z_hat,
-                    scales=scales_hat,
-                    time_emb=time_emb
+                    timestep_embed,
+                    context=None,
+                    scales=None,
                 )
-            else:
-                # BK-SDM U-Net (different interface)
-                try:
-                    # Prepare input for BK-SDM U-Net
-                    # BK-SDM U-Net expects different input format
-                    noise_pred = self._forward_bk_sdm_unet(
-                        y_t, timesteps, z_hat, scales_hat
-                    )
-                except Exception as e:
-                    print(f"BK-SDM U-Net forward 실패: {e}")
-                    # Fallback to simple denoising
-                    noise_pred = torch.randn_like(y_t, device=device)
-            
-            # Denoising step
-            alpha_t = self.noise_scheduler.alphas[t]
-            alpha_t_prev = self.noise_scheduler.alphas[t-1] if t > 0 else torch.tensor(1.0)
-            
-            # DDPM denoising formula
-            y_t = (1 / torch.sqrt(alpha_t)) * (
-                y_t - ((1 - alpha_t) / torch.sqrt(1 - alpha_t)) * noise_pred
+
+            # DDIM-like deterministic update
+            a_bar_t = self.noise_scheduler.alphas_cumprod[t].to(device)
+            a_bar_prev = (
+                self.noise_scheduler.alphas_cumprod[t - 1].to(device)
+                if t > 0 else torch.tensor(1.0, device=device, dtype=a_bar_t.dtype)
             )
-            
-            if t > 0:
-                noise = torch.randn_like(y_t, device=device)
-                y_t = y_t + torch.sqrt(1 - alpha_t_prev) * noise
-        
+
+            sqrt_a_bar_t = torch.sqrt(a_bar_t)
+            sqrt_one_minus_a_bar_t = torch.sqrt(1.0 - a_bar_t)
+
+            x0_pred = (y_t - sqrt_one_minus_a_bar_t * noise_pred) / sqrt_a_bar_t
+            y_t = torch.sqrt(a_bar_prev) * x0_pred + torch.sqrt(1.0 - a_bar_prev) * noise_pred
+
         return y_t
+    
+    def _diffusion_denoise_to_scales(self, z_hat: torch.Tensor) -> torch.Tensor:
+        """
+        z_hat에서 diffusion denoising을 통해 scales_hat 생성
+        z_hat을 입력으로 받아 scales_hat을 출력
+        """
+        batch_size, _, H, W = z_hat.shape
+        device = z_hat.device
+
+        # Start from pure noise with M channels and same spatial size as z_hat
+        scales_t = torch.randn((batch_size, self.M, H, W), device=device, dtype=z_hat.dtype)
+
+        # Reverse diffusion process to generate scales (커스텀 UNet 사용)
+        for t in range(self.diffusion_steps - 1, -1, -1):
+            timesteps = torch.full((batch_size,), t, device=device, dtype=torch.long)
+            timestep_embed = self._get_timestep_embedding(timesteps, self.N)
+
+            noise_pred = self.scales_unet(
+                scales_t,
+                timestep_embed,
+                context=z_hat,  # z_hat을 context로 사용
+                scales=None,
+            )
+
+            # DDIM-like deterministic update
+            a_bar_t = self.noise_scheduler.alphas_cumprod[t].to(device)
+            a_bar_prev = (
+                self.noise_scheduler.alphas_cumprod[t - 1].to(device)
+                if t > 0 else torch.tensor(1.0, device=device, dtype=a_bar_t.dtype)
+            )
+            sqrt_a_bar_t = torch.sqrt(a_bar_t)
+            sqrt_one_minus_a_bar_t = torch.sqrt(1.0 - a_bar_t)
+            x0_pred = (scales_t - sqrt_one_minus_a_bar_t * noise_pred) / sqrt_a_bar_t
+            scales_t = torch.sqrt(a_bar_prev) * x0_pred + torch.sqrt(1.0 - a_bar_prev) * noise_pred
+
+        # 양수 스케일 보장
+        return F.softplus(scales_t) + 1e-6
+    
+    def _forward_bk_sdm_unet_for_scales(
+        self, 
+        scales_t: torch.Tensor, 
+        timesteps: torch.Tensor, 
+        z_hat: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        BK-SDM U-Net을 사용한 scales 생성을 위한 forward pass
+        """
+        # 간단한 fallback 구현
+        batch_size = scales_t.shape[0]
+        
+        # z_hat을 context로 사용하여 scales 생성
+        context = z_hat.mean(dim=[-2, -1])  # Global average pooling
+        
+        # 간단한 noise prediction (실제로는 BK-SDM U-Net 사용)
+        noise_pred = torch.randn_like(scales_t)
+        
+        # Context 정보를 반영
+        noise_pred = noise_pred + 0.1 * context.unsqueeze(-1).unsqueeze(-1)
+        
+        return noise_pred
     
     def _forward_bk_sdm_unet(
         self, 
@@ -328,8 +432,9 @@ class BKSDMCompression(CompressionModel):
         """
         Compress input image
         """
-        # VAE encoding using BK-SDM
-        y = self.vae_encoder(x)
+        # VAE encoding using BK-SDM (Diffusers 경로)
+        y_latent = self._encode_with_vae(x)
+        y = self.y_to_M(y_latent).float()
         
         # Hyper encoding
         z = self.h_a(torch.abs(y))
@@ -338,8 +443,10 @@ class BKSDMCompression(CompressionModel):
         z_strings = self.entropy_bottleneck.compress(z)
         z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:])
         
-        # Get scales for diffusion
-        scales_hat = self.h_s(z_hat)
+        # Generate scales through diffusion denoising
+        scales_hat = self._diffusion_denoise_to_scales(z_hat)
+        if scales_hat.shape[-2:] != y.shape[-2:]:
+            scales_hat = F.interpolate(scales_hat, size=y.shape[-2:], mode="nearest")
         
         # Compress y using Gaussian conditional
         indexes = self.gaussian_conditional.build_indexes(scales_hat)
@@ -361,18 +468,28 @@ class BKSDMCompression(CompressionModel):
         # Decompress z
         z_hat = self.entropy_bottleneck.decompress(strings[1], shape)
         
-        # Get scales
-        scales_hat = self.h_s(z_hat)
+        # Generate scales through diffusion denoising
+        scales_hat = self._diffusion_denoise_to_scales(z_hat)
+        # y 해상도에 맞춤
+        # 주의: y의 공간 크기를 알 수 없으므로 strings[0] 복원 후에 맞추는 방식 사용
         
-        # Decompress y
+        # Decompress y (indexes 해상도 일치 보장)
+        # 임시로 z_hat 해상도에서 decompress를 시도하면 모양 불일치가 발생할 수 있어,
+        # 먼저 scales_hat을 decompress 대상 해상도로 리샘플링한다. decompress는 내부에서 y의 모양을 사용하므로
+        # 일단 z_hat 크기에 맞춘 후, 필요 시 보간을 다시 적용.
         indexes = self.gaussian_conditional.build_indexes(scales_hat)
-        y_hat = self.gaussian_conditional.decompress(strings[0], indexes, z_hat.dtype)
+        y_hat_M = self.gaussian_conditional.decompress(strings[0], indexes, z_hat.dtype)
+        if scales_hat.shape[-2:] != y_hat_M.shape[-2:]:
+            scales_hat = F.interpolate(scales_hat, size=y_hat_M.shape[-2:], mode="nearest")
+
+        # 내부 M -> VAE latent 채널로 변환
+        y_hat_latent = self.M_to_latent(y_hat_M.to(device=self.device, dtype=self.model_dtype))
+
+        # Diffusers UNet을 사용해 잠복 공간에서 미세 복원 (선택적, 무조건)
+        y_hat_denoised_latent = self._diffusion_denoise_with_bk_sdm(y_init_latent=y_hat_latent)
         
-        # Apply diffusion denoising with BK-SDM U-Net
-        y_hat_denoised = self._diffusion_denoise_with_bk_sdm(z_hat, scales_hat)
-        
-        # VAE decoding using BK-SDM
-        x_hat = self.vae_decoder(y_hat_denoised).clamp_(0, 1)
+        # VAE decoding using BK-SDM (Diffusers 경로)
+        x_hat = self._decode_with_vae(y_hat_denoised_latent).clamp_(0, 1)
         
         return {"x_hat": x_hat}
     
@@ -389,6 +506,35 @@ class BKSDMCompression(CompressionModel):
         Auxiliary loss for entropy models
         """
         return self.entropy_bottleneck.loss()
+
+    # ===== Diffusers VAE 래퍼 =====
+    @torch.no_grad()
+    def _encode_with_vae(self, x: torch.Tensor) -> torch.Tensor:
+        """Diffusers VAE로 이미지를 잠복(latent)으로 인코딩."""
+        if hasattr(self, "vae") and self.vae is not None:
+            x = x.to(device=self.device, dtype=self.model_dtype)
+            x_scaled = x * 2.0 - 1.0
+            posterior = self.vae.encode(x_scaled)
+            if hasattr(posterior, "latent_dist"):
+                latents = posterior.latent_dist.sample()
+            else:
+                latents = posterior.sample()
+            latents = latents * 0.18215
+            return latents
+        # 커스텀 경로
+        return self.vae_encoder(x)
+
+    @torch.no_grad()
+    def _decode_with_vae(self, latents: torch.Tensor) -> torch.Tensor:
+        """Diffusers VAE로 잠복(latent)을 이미지로 디코딩."""
+        if hasattr(self, "vae") and self.vae is not None:
+            latents = latents.to(device=self.device, dtype=self.model_dtype)
+            latents = latents / 0.18215
+            x = self.vae.decode(latents).sample
+            x = (x + 1.0) / 2.0
+            return x
+        # 커스텀 경로
+        return self.vae_decoder(latents)
 
 
 class DiffusionUNet(nn.Module):

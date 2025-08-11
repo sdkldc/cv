@@ -1,0 +1,19 @@
+2025-08-11 16:21:37,564 - INFO - Training on device: cpu
+2025-08-11 16:21:37,565 - INFO - Arguments: {'bk_sdm_path': '../BK-SDM', 'data_path': 'C:/Users/micly/DataAI/dataset/cifar10', 'val_data_path': None, 'output_dir': './outputs', 'batch_size': 4, 'epochs': 100, 'lr': 0.0001, 'lambda_rate': 0.0001, 'image_size': 256, 'N': 128, 'M': 128, 'diffusion_steps': 30, 'device': 'cuda', 'resume': None, 'use_pretrained_vae': True, 'use_pretrained_unet': True}
+2025-08-11 16:22:05,660 - INFO - Model created successfully
+2025-08-11 16:23:15,650 - INFO - Training on device: cpu
+2025-08-11 16:23:15,650 - INFO - Arguments: {'bk_sdm_path': '../BK-SDM', 'data_path': 'C:\\Users\\micly\\DataAI\\dataset\\cifar10_images', 'val_data_path': None, 'output_dir': './outputs', 'batch_size': 4, 'epochs': 100, 'lr': 0.0001, 'lambda_rate': 0.0001, 'image_size': 256, 'N': 128, 'M': 128, 'diffusion_steps': 30, 'device': 'cuda', 'resume': None, 'use_pretrained_vae': True, 'use_pretrained_unet': True}
+2025-08-11 16:23:35,333 - INFO - Model created successfully
+2025-08-11 16:23:39,832 - INFO - Starting training...
+2025-08-11 16:34:32,359 - INFO - Training on device: cpu
+2025-08-11 16:34:32,359 - INFO - Arguments: {'bk_sdm_path': '../BK-SDM', 'data_path': 'C:\\Users\\micly\\DataAI\\dataset\\cifar10_images', 'val_data_path': None, 'output_dir': './outputs', 'batch_size': 5, 'epochs': 3, 'lr': 0.0001, 'lambda_rate': 0.0001, 'image_size': 256, 'N': 128, 'M': 128, 'diffusion_steps': 30, 'device': 'cuda', 'resume': None, 'use_pretrained_vae': True, 'use_pretrained_unet': True}
+2025-08-11 16:34:40,816 - INFO - Model created successfully
+2025-08-11 16:35:02,781 - INFO - Starting training...
+2025-08-11 16:40:46,607 - INFO - Training on device: cpu
+2025-08-11 16:40:46,607 - INFO - Arguments: {'bk_sdm_path': '../BK-SDM', 'data_path': 'C:\\Users\\micly\\DataAI\\dataset\\cifar10_images', 'val_data_path': None, 'output_dir': './outputs', 'batch_size': 5, 'epochs': 3, 'lr': 0.0001, 'lambda_rate': 0.0001, 'image_size': 256, 'N': 128, 'M': 128, 'diffusion_steps': 30, 'device': 'cuda', 'resume': None, 'use_pretrained_vae': True, 'use_pretrained_unet': True}
+2025-08-11 16:41:05,630 - INFO - Model created successfully
+2025-08-11 16:41:06,549 - INFO - Starting training...
+2025-08-11 16:46:09,923 - INFO - Training on device: cpu
+2025-08-11 16:46:09,924 - INFO - Arguments: {'bk_sdm_path': '../BK-SDM', 'data_path': 'C:\\Users\\micly\\DataAI\\dataset\\cifar10_images', 'val_data_path': None, 'output_dir': './outputs', 'batch_size': 5, 'epochs': 3, 'lr': 0.0001, 'lambda_rate': 0.0001, 'image_size': 256, 'N': 128, 'M': 128, 'diffusion_steps': 30, 'device': 'cuda', 'resume': None, 'use_pretrained_vae': True, 'use_pretrained_unet': True}
+2025-08-11 16:46:15,283 - INFO - Model created successfully
+2025-08-11 16:46:16,480 - INFO - Starting training...

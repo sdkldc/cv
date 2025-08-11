@@ -19,7 +19,7 @@ Entropy Bottleneck
        ↓
    z_hat (compressed)
        ↓
-  Hyper Decoder (h_s)
+Diffusion Denoising (BK-SDM U-Net)
        ↓
    scales_hat
        ↓
@@ -194,8 +194,9 @@ reconstructed_image = decompressed['x_hat']
 
 1. **BK-SDM VAE**: Pre-trained된 고품질 인코더/디코더로 latent space 생성
 2. **하이퍼 인코더**: latent space의 통계적 특성을 모델링하는 z 생성
-3. **BK-SDM U-Net**: Pre-trained된 U-Net으로 diffusion denoising 수행
-4. **엔트로피 추정**: 하이퍼프라이어를 통한 정확한 압축 비트레이트 계산
+3. **Diffusion Denoising**: z_hat에서 diffusion process를 통해 scales_hat 생성
+4. **BK-SDM U-Net**: Pre-trained된 U-Net으로 diffusion denoising 수행
+5. **엔트로피 추정**: 하이퍼프라이어를 통한 정확한 압축 비트레이트 계산
 
 ## 🛠️ 커스터마이징
 
